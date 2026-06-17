@@ -1,13 +1,14 @@
 from dataclasses import dataclass
 from typing import Optional
-import torch
+
+import jax.numpy as jnp
 
 
 @dataclass
 class LayerStats:
     layer_idx: int
     ple_dominance_score: float
-    ple_attribution_by_channel: torch.Tensor
+    ple_attribution_by_channel: jnp.ndarray
     variance_explained_by_ple: float
     total_variance: float
     ple_variance: float
@@ -26,7 +27,7 @@ class ChannelStats:
 
 @dataclass
 class ProfilingResults:
-    layer_stats: list[LayerStats]
+    layer_stats: list
     ple_dominant_layers: list[int]
     ple_dominant_channels: dict[int, list[int]]
     calibration_samples: int

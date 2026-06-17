@@ -1,0 +1,14 @@
+{
+  "temporal_bench": {
+    "staleness": 0.0,
+    "asof_qa": 0.0,
+    "causal_query": 0.0
+  },
+  "memory": {
+    "param_mb": 173.10546875,
+    "buffer_mb": 0.0,
+    "total_mb": 173.10546875
+  },
+  "model_type": "mock_ple_coded",
+  "num_samples": 50
+}

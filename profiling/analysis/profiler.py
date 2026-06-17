@@ -1,10 +1,14 @@
+# Phase 1: Profiling — JAX/Flax implementation for PLE dominance analysis
 import logging
 from pathlib import Path
 from typing import Optional, Literal
 
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.training.train_state import TrainState
+import optax
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,14 +19,14 @@ class ModelLoader:
         self.model_source = model_source
         self.model = None
         self.tokenizer = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if jax.devices()[0].platform == "cuda" else "cpu"
         logger.info(f"Using device: {self.device}")
 
     def load_gemma_e2b(
         self,
         model_path: Optional[str] = None,
         model_name: Optional[str] = "google/gemma-4-E2B-it",
-    ) -> tuple[nn.Module, object]:
+    ):
         if self.model_source == "lmstudio":
             return self._load_from_lmstudio(model_path)
         elif self.model_source == "huggingface":
@@ -30,7 +34,7 @@ class ModelLoader:
         else:
             return self._load_from_local(model_path)
 
-    def _load_from_lmstudio(self, model_path: Optional[str] = None) -> tuple[nn.Module, object]:
+    def _load_from_lmstudio(self, model_path: Optional[str] = None):
         try:
             from lmstudio import LMStudioClient
             client = LMStudioClient()
@@ -49,7 +53,8 @@ class ModelLoader:
             logger.warning("lmstudio package not available, falling back to transformers")
             return self._load_from_huggingface(model_name)
 
-    def _load_from_huggingface(self, model_name: str) -> tuple[nn.Module, object]:
+    def _load_from_huggingface(self, model_name: str):
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         logger.info(f"Loading {model_name} from HuggingFace")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -60,9 +65,10 @@ class ModelLoader:
         )
         return self.model, self.tokenizer
 
-    def _load_from_local(self, model_path: Optional[str]) -> tuple[nn.Module, object]:
+    def _load_from_local(self, model_path: Optional[str]):
         if not model_path:
             raise ValueError("model_path required for local loading")
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         logger.info(f"Loading from local path: {model_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -73,6 +79,13 @@ class ModelLoader:
         )
         return self.model, self.tokenizer
 
+    def get_model_weights(self) -> dict:
+        """Extract model weights as JAX arrays."""
+        if self.model is None:
+            return {}
+        state_dict = self.model.state_dict()
+        return {k: jnp.array(v.numpy()) for k, v in state_dict.items()}
+
 
 def get_calibration_dataset(
     dataset_name: str = "wikitext",
@@ -80,7 +93,7 @@ def get_calibration_dataset(
     split: str = "train",
     seq_len: int = 512,
     num_samples: int = 256,
-) -> DataLoader:
+):
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
@@ -104,105 +117,98 @@ def get_calibration_dataset(
     tokenized = dataset.map(tokenize, batched=True, remove_columns=["text"])
     tokenized.set_format("torch")
 
-    return DataLoader(tokenized["input_ids"], batch_size=4, shuffle=False)
+    return tokenized
 
 
 class LayerActivationCollector:
-    def __init__(self, model: nn.Module):
+    def __init__(self, model, layer_names: Optional[list[str]] = None):
         self.model = model
-        self.hooks = []
+        self.layer_names = layer_names or []
         self.layer_inputs = {}
         self.layer_outputs = {}
-        self._register_hooks()
+        self._hook_handles = []
 
-    def _register_hooks(self):
-        def get_layer_input(name: str):
-            def hook(module, input, output):
-                self.layer_inputs[name] = input[0].detach()
-            return hook
-
-        def get_layer_output(name: str):
-            def hook(module, input, output):
-                self.layer_outputs[name] = output[0].detach() if isinstance(output, tuple) else output.detach()
-            return hook
-
+    def register_hooks(self, layer_names: list[str]):
+        """Register hooks for specified layer names."""
+        import torch
         for name, module in self.model.named_modules():
             if "model.language_model.layers." in name:
                 parts = name.split(".")
                 if len(parts) >= 4 and parts[-1].isdigit():
                     layer_num = int(parts[-1])
-                    handle_inp = module.register_forward_hook(get_layer_input(name), with_kwargs=True)
-                    handle_out = module.register_forward_hook(get_layer_output(f"{name}_out"), with_kwargs=True)
-                    self.hooks.extend([handle_inp, handle_out])
+                    if f"layer_{layer_num}" in layer_names or not layer_names:
+                        handle_inp = module.register_forward_hook(
+                            self._create_input_hook(name), with_kwargs=True
+                        )
+                        handle_out = module.register_forward_hook(
+                            self._create_output_hook(f"{name}_out"), with_kwargs=True
+                        )
+                        self._hook_handles.extend([handle_inp, handle_out])
+
+    def _create_input_hook(self, name: str):
+        def hook(module, input, output):
+            self.layer_inputs[name] = input[0].detach()
+        return hook
+
+    def _create_output_hook(self, name: str):
+        def hook(module, input, output):
+            self.layer_outputs[name] = output[0].detach() if isinstance(output, tuple) else output.detach()
+        return hook
 
     def clear(self):
         self.layer_inputs.clear()
         self.layer_outputs.clear()
 
     def remove_hooks(self):
-        for handle in self.hooks:
+        for handle in self._hook_handles:
             handle.remove()
-        self.hooks.clear()
+        self._hook_handles.clear()
 
 
 def compute_ple_dominance_score(
-    ple_activation: torch.Tensor,
-    backbone_activation: torch.Tensor,
+    ple_activation: jnp.ndarray,
+    backbone_activation: jnp.ndarray,
 ) -> float:
-    total_var = torch.var(backbone_activation).item()
+    total_var = jnp.var(backbone_activation)
     if total_var == 0:
         return 0.0
-    ple_var = torch.var(ple_activation).item()
+    ple_var = jnp.var(ple_activation)
     score = ple_var / total_var
-    return min(score, 1.0)
+    return float(jnp.minimum(score, 1.0))
 
 
 def compute_channel_attribution(
-    ple_activation: torch.Tensor,
-    backbone_activation: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    ple_activation: jnp.ndarray,
+    backbone_activation: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute per-channel PLE vs backbone attribution scores."""
-    ple_var = torch.var(ple_activation, dim=0)
-    backbone_var = torch.var(backbone_activation, dim=0)
+    ple_var = jnp.var(ple_activation, axis=(0, 1))
+    backbone_var = jnp.var(backbone_activation, axis=(0, 1))
     total_var = ple_var + backbone_var + 1e-8
     ple_attr = ple_var / total_var
     backbone_attr = backbone_var / total_var
     return ple_attr, backbone_attr
 
 
-def run_profiling(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: str = "cuda",
-    variance_threshold: float = 0.5,
-) -> dict:
-    """Alias for run_layer_profiling for backward compatibility."""
-    return run_layer_profiling(model, dataloader, device, variance_threshold)
-
-
-# Alias for backward compatibility
-ActivationCollector = LayerActivationCollector
-
-
 def compute_residual_variance(
-    input_act: torch.Tensor,
-    output_act: torch.Tensor,
+    input_act: jnp.ndarray,
+    output_act: jnp.ndarray,
 ) -> float:
     if input_act.shape != output_act.shape:
         return -1.0
     residual = output_act - input_act
-    return torch.var(residual).item()
+    return float(jnp.var(residual))
 
 
 def analyze_layer_ple_dominance(
-    layer_input: torch.Tensor,
-    layer_output: torch.Tensor,
+    layer_input: jnp.ndarray,
+    layer_output: jnp.ndarray,
     layer_idx: int,
     variance_threshold: float = 0.5,
 ) -> dict:
     residual = layer_output - layer_input
-    ple_var = torch.var(residual).item()
-    output_var = torch.var(layer_output).item()
+    ple_var = jnp.var(residual)
+    output_var = jnp.var(layer_output)
 
     if output_var > 0:
         ple_dominance = ple_var / output_var
@@ -213,21 +219,37 @@ def analyze_layer_ple_dominance(
 
     return {
         "layer_idx": layer_idx,
-        "ple_dominance": ple_dominance,
-        "ple_variance": ple_var,
-        "output_variance": output_var,
-        "is_ple_dominant": is_ple_dominant,
-        "residual_variance": ple_var,
+        "ple_dominance": float(ple_dominance),
+        "ple_variance": float(ple_var),
+        "output_variance": float(output_var),
+        "is_ple_dominant": bool(is_ple_dominant),
+        "residual_variance": float(ple_var),
     }
 
 
-def run_layer_profiling(
-    model: nn.Module,
-    dataloader: DataLoader,
+def run_profiling(
+    model,
+    dataloader,
     device: str = "cuda",
     variance_threshold: float = 0.5,
 ) -> dict:
+    """Alias for run_layer_profiling for backward compatibility."""
+    return run_layer_profiling(model, dataloader, device, variance_threshold)
+
+
+ActivationCollector = LayerActivationCollector
+
+
+def run_layer_profiling(
+    model,
+    dataloader,
+    device: str = "cuda",
+    variance_threshold: float = 0.5,
+) -> dict:
+    """Run PLE dominance profiling on model layers."""
+    import torch
     collector = LayerActivationCollector(model)
+    collector.register_hooks([])
     layer_results = {}
     ple_dominant_layers = []
 
@@ -270,8 +292,8 @@ def run_layer_profiling(
         output_mean = torch.mean(outputs, dim=(0, 1))
 
         analysis = analyze_layer_ple_dominance(
-            input_mean.unsqueeze(0),
-            output_mean.unsqueeze(0),
+            input_mean.unsqueeze(0).numpy(),
+            output_mean.unsqueeze(0).numpy(),
             layer_num,
             variance_threshold,
         )

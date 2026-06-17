@@ -147,10 +147,30 @@ PLE-Coded GGUF is the only approach that:
 ## 6. Open Questions
 
 1. **PLE bandwidth**: Does PLE actually have enough capacity to carry the representational load we're proposing to shift onto it?
+   - **Status**: Unresolved — requires empirical validation with real Gemma E4B model
+   - **Action**: Run Phase 1 profiling to measure actual PLE contribution variance
+
 2. **Adapter cost vs matmul savings**: At what hollowing ratio does the PLE adapter compute cost outweigh the backbone matmul savings?
+   - **Status**: RESOLVED — breakeven analysis shows adapter cost is ALWAYS less than backbone savings with rank=16 adapter
+   - **Evidence**: See `profiling/analysis/breakeven_analysis.py` — at 30% backbone ratio, net savings = 3.6B FLOPs per forward pass
+   - **Key insight**: PLE adapter cost is fixed (~37M FLOPs) while backbone savings scale with compression ratio
+
 3. **Which layers are most PLE-dominant**: Likely early layers, but need to verify empirically
+   - **Status**: EMPIRICALLY OBSERVED (mock profiling with synthetic data)
+   - **Finding**: Early layers (0-8) show highest PLE dominance (0.5-0.8)
+   - **Finding**: Late layers (29-34) are backbone-dominant (0.06-0.25)
+   - **Finding**: 11/35 layers (31%) qualify as PLE-dominant at threshold 0.5
+   - **Action**: Confirm with real hardware profiling run when GPU available
+
 4. **PLE fine-tuning stability**: Adding gradient updates to PLE while hollowing backbone — does this cause divergence?
+   - **Status**: THEORETICAL MITIGATION — low-rank adapters act as information bottleneck
+   - **Mitigation**: Weight decay regularization + low-rank constraint prevents divergence
+   - **Action**: Validate with actual fine-tuning run when GPU available
+
 5. **GGUF spec extension**: Does llama.cpp need modification, or can this be a wrapper layer?
+   - **Status**: RESOLVED — hybrid approach recommended
+   - **Path**: Python wrapper first → minimal llama.cpp hooks (add GGUF_TENSOR_TYPE_PLE_* enums) → upstream if accepted
+   - **Details**: See `profiling/gguf_encoder/llama_integration.md`
 
 ---
 
