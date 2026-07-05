@@ -1,5 +1,6 @@
 # Phase 1: Profiling — JAX/Flax implementation for PLE dominance analysis
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -57,11 +58,13 @@ class ModelLoader:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         logger.info(f"Loading {model_name} from HuggingFace")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float32,
-            device_map=self.device,
+            device_map="auto" if self.device == "cuda" else None,
+            token=token,
         )
         return self.model, self.tokenizer
 
@@ -75,7 +78,7 @@ class ModelLoader:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.float32,
-            device_map=self.device,
+            device_map="auto" if self.device == "cuda" else None,
         )
         return self.model, self.tokenizer
 
@@ -84,7 +87,7 @@ class ModelLoader:
         if self.model is None:
             return {}
         state_dict = self.model.state_dict()
-        return {k: jnp.array(v.numpy()) for k, v in state_dict.items()}
+        return {k: jnp.array(v.detach().cpu().numpy()) for k, v in state_dict.items()}
 
 
 def get_calibration_dataset(
@@ -146,12 +149,13 @@ class LayerActivationCollector:
                         self._hook_handles.extend([handle_inp, handle_out])
 
     def _create_input_hook(self, name: str):
-        def hook(module, input, output):
-            self.layer_inputs[name] = input[0].detach()
+        def hook(module, args, kwargs, output):
+            if args:
+                self.layer_inputs[name] = args[0].detach()
         return hook
 
     def _create_output_hook(self, name: str):
-        def hook(module, input, output):
+        def hook(module, args, kwargs, output):
             self.layer_outputs[name] = output[0].detach() if isinstance(output, tuple) else output.detach()
         return hook
 

@@ -44,6 +44,14 @@ All phases implemented. Open questions resolved (Q2, Q3, Q5) with empirical/theo
 
 Hardware validation still pending (requires GPU with 24GB+ VRAM).
 
+## Colab GPU Tunnel
+
+For remote GPU validation, use the Colab runbook in `colab/README.md`. It installs the Colab dependencies, reads `HF_TOKEN` and `NGROK_AUTHTOKEN` from runtime environment variables, and launches a Gradio control panel through either ngrok or Gradio share links:
+
+```bash
+python colab/run_colab_tunnel.py --tunnel ngrok --port 7860
+```
+
 ## License
 
 See [LICENSE](LICENSE) for terms. Commercial use requires written agreement.

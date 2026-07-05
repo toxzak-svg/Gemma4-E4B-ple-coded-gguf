@@ -1,0 +1,11 @@
+accelerate>=0.27.0
+datasets>=2.18.0
+flax>=0.8.0
+gradio>=4.44.0
+huggingface-hub>=0.23.0
+jax[cuda12]>=0.4.28; platform_system == "Linux"
+numpy>=1.24.0
+optax>=0.2.0
+pyngrok>=7.1.0
+torch>=2.1.0
+transformers>=4.42.0
